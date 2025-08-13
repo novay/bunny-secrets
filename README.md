@@ -71,14 +71,13 @@ use Novay\BunnySecret\BunnySecret;
 use Illuminate\Http\UploadedFile;
 
 // Upload a file to BunnyCDN
-$file = new UploadedFile(
-    'path/to/your/local/file.jpg',
-    'file.jpg'
+$filePath = BunnySecret::uploadCDN(
+  file: $this->photo, 
+  path: 'berau/sudik/avatar', 
+  filename: str()->slug('filename').'-'.uniqid()
 );
-$filePath = BunnySecret::uploadCDN($file, 'images');
-
-if ($filePath) {
-    echo "File uploaded successfully to: " . $filePath;
+if ($filePath === false) {
+  throw new \Exception("Failed to upload photo to CDN.");
 }
 
 // Get the public URL of the file
@@ -91,7 +90,7 @@ $resizedImageUrl = BunnySecret::imageKit($imageUrl, 800);
 echo "Transformed image URL: " . $resizedImageUrl;
 
 // Delete a file
-$isDeleted = BunnySecret::deleteCDN($filePath);
+$isDeleted = BunnySecret::deleteCDN(filePath: $filePath);
 if ($isDeleted) {
     echo "File deleted successfully.";
 }
