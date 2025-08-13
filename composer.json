@@ -1,0 +1,40 @@
+{
+    "name": "novay/bunny-secrets",
+    "description": "Laravel package for BunnyCDN secrets management and filesystem integration with Borneo Secrets Manager.",
+    "keywords": [
+        "bunnycdn",
+        "secrets",
+        "filesystem",
+        "laravel"
+    ],
+    "type": "library",
+    "license": "MIT",
+    "homepage": "https://github.com/novay/bunny-secrets",
+    "authors": [
+        {
+            "name": "Novianto Rahmadi",
+            "email": "novay@btekno.id"
+        }
+    ],
+    "autoload": {
+        "psr-4": {
+            "Novay\\BunnySecret\\": "src/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "require": {
+        "php": "^8.1",
+        "laravel/framework": "^10.0|^11.0|^12.0",
+        "platformcommunity/flysystem-bunnycdn": "^3.0"
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Novay\\BunnySecret\\BunnySecretServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "dev"
+}
