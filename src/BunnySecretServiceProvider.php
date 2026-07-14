@@ -2,99 +2,57 @@
 
 namespace Novay\BunnySecret;
 
-use Illuminate\Support\ServiceProvider;
-use Illuminate\Support\Facades\Storage;
-use PlatformCommunity\Flysystem\BunnyCDN\BunnyCDNAdapter;
-use PlatformCommunity\Flysystem\BunnyCDN\BunnyCDNClient;
-use League\Flysystem\Filesystem;
 use Illuminate\Filesystem\FilesystemAdapter;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\ServiceProvider;
+use League\Flysystem\Filesystem;
+use Novay\BunnySecret\Exceptions\BunnySecretException;
 use Novay\BunnySecret\Helpers\Secret;
+use PlatformCommunity\Flysystem\BunnyCDN\BunnyCDNAdapter;
+use PlatformCommunity\Flysystem\BunnyCDN\BunnyCDNClient;
 use Throwable;
 
-/**
- * BunnySecretServiceProvider
- *
- * Service Provider ini bertanggung jawab untuk mendaftarkan dan mem-bootstrap
- * semua fungsionalitas yang terkait dengan package BunnySecret.
- * Ini termasuk konfigurasi driver BunnyCDN filesystem, pendaftaran service Secret,
- * dan publikasi aset konfigurasi.
- *
- * @package Novay\BunnySecret
- * @author Novay <novay@btekno.id>
- * @license https://opensource.org/licenses/MIT MIT License
- */
 class BunnySecretServiceProvider extends ServiceProvider
 {
-    /**
-     * Register any application services.
-     *
-     * Metode ini digunakan untuk mendaftarkan binding service ke dalam IoC container.
-     * Ini memastikan bahwa layanan SecretManager dan konfigurasi default BunnyCDN
-     * tersedia untuk aplikasi.
-     *
-     * @return void
-     */
     public function register(): void
     {
-        // Daftarkan service Novay\BunnySecret\Helpers\Secret sebagai singleton
-        $this->registerSecretManager();
+        $this->mergeConfigFrom(__DIR__ . '/../config/bunnycdn.php', 'bunnycdn');
 
-        // Gabungkan konfigurasi package dengan konfigurasi aplikasi
-        $this->mergeConfigFrom(
-            __DIR__ . '/../config/bunnycdn.php', 'bunnycdn'
-        );
-
-        // Daftarkan BunnySecretManager sebagai singleton di service container
-        $this->app->singleton('bunnysecret', function ($app) {
-            return new BunnySecretManager($app->make(Secret::class));
-        });
+        $this->registerSecretClient();
+        $this->registerManager();
     }
 
-    /**
-     * Bootstrap any application services.
-     *
-     * Metode ini dipanggil setelah semua service provider lain telah didaftarkan.
-     * Ini adalah tempat yang tepat untuk mem-bootstrap apa pun yang dibutuhkan oleh package,
-     * seperti publikasi konfigurasi dan konfigurasi driver BunnyCDN filesystem.
-     *
-     * @return void
-     */
     public function boot(): void
     {
-        // Publikasikan konfigurasi package
         $this->publishConfig();
-
-        // Konfigurasi driver BunnyCDN filesystem
-        $this->configureBunnyCDNFilesystem();
+        $this->ensureBunnyDiskConfigExists();
+        $this->registerFilesystemDriver();
     }
 
-    /**
-     * Mendaftarkan layanan Novay\BunnySecret\Helpers\Secret sebagai singleton.
-     *
-     * Mengikat implementasi kelas Secret ke dalam service container,
-     * menginjeksikan base URI dan API key dari variabel lingkungan.
-     *
-     * @return void
-     */
-    protected function registerSecretManager(): void
+    protected function registerSecretClient(): void
     {
-        $this->app->singleton(Secret::class, function ($app) {
-            $baseUri = env('SECRET_URI', 'https://btekno.id');
-            $apiKey = env('SECRET_KEY', 'your-api-key-here');
-
-            return new Secret($baseUri, $apiKey);
+        $this->app->singleton(Secret::class, static function (): Secret {
+            return new Secret(
+                baseUri: (string) config('bunnycdn.secret_api.base_uri', ''),
+                apiKey: (string) config('bunnycdn.secret_api.api_key', ''),
+                enabled: static::truthy(config('bunnycdn.secret_api.enabled', false)),
+                timeout: (int) config('bunnycdn.secret_api.timeout', 10),
+                retries: (int) config('bunnycdn.secret_api.retries', 1),
+                retrySleepMs: (int) config('bunnycdn.secret_api.retry_sleep_ms', 200),
+            );
         });
     }
 
-    /**
-     * Mempublikasikan file konfigurasi package.
-     *
-     * Memungkinkan pengguna aplikasi untuk menyalin file konfigurasi `bunnycdn.php`
-     * dari package ke direktori `config` aplikasi, sehingga dapat dimodifikasi.
-     *
-     * @return void
-     */
+    protected function registerManager(): void
+    {
+        $this->app->singleton(BunnySecretManager::class, static function ($app): BunnySecretManager {
+            return new BunnySecretManager($app->make(Secret::class));
+        });
+
+        $this->app->alias(BunnySecretManager::class, 'bunnysecret');
+    }
+
     protected function publishConfig(): void
     {
         $this->publishes([
@@ -102,98 +60,189 @@ class BunnySecretServiceProvider extends ServiceProvider
         ], 'bunny-secrets-config');
     }
 
-    /**
-     * Mengonfigurasi driver BunnyCDN Filesystem secara dinamis.
-     *
-     * Mengambil konfigurasi disk dari `bunnycdn.php`, mendapatkan API key secara dinamis
-     * dari file sementara atau layanan Secret, dan kemudian memperluas `Storage` Facade
-     * dengan driver `bunnycdn` kustom.
-     *
-     * @return void
-     */
-    protected function configureBunnyCDNFilesystem(): void
+    protected function ensureBunnyDiskConfigExists(): void
     {
-        $bunnyConfig = config('bunnycdn.disk');
+        $packageDisk = config('bunnycdn.disk', []);
+        $appDisk = config('filesystems.disks.bunnycdn', []);
 
-        // Pastikan konfigurasi driver adalah 'bunnycdn'
-        if (!isset($bunnyConfig['driver']) || $bunnyConfig['driver'] !== 'bunnycdn') {
-            return;
-        }
+        config([
+            'filesystems.disks.bunnycdn' => array_replace_recursive($packageDisk, $appDisk),
+        ]);
+    }
 
-        // Dapatkan API key BunnyCDN
-        $bunnyApiKey = $this->getBunnyApiKey();
+    protected function registerFilesystemDriver(): void
+    {
+        Storage::extend('bunnycdn', function ($app, array $config): FilesystemAdapter {
+            $config = $this->resolveDiskConfig($config);
 
-        // Jika API key tidak ditemukan, log peringatan dan hentikan konfigurasi
-        if (!$bunnyApiKey) {
-            Log::warning('BunnyCDN API Key not found. BunnyCDN filesystem driver might not function correctly.');
-            return;
-        }
-
-        // Set API key ke konfigurasi disk di runtime
-        $bunnyConfig['api_key'] = $bunnyApiKey;
-
-        // Pastikan cdn_url ada di $bunnyConfig jika ingin digunakan di adapter
-        // Ini penting karena nilai default di config/bunnycdn.php mungkin tidak langsung terakses di $config adapter
-        if (!isset($bunnyConfig['cdn_url'])) {
-             $bunnyConfig['cdn_url'] = env('BUNNYCDN_CDN_URL', 'https://btekno.b-cdn.net');
-        }
-
-        // Perbarui konfigurasi filesystems di runtime
-        config(['filesystems.disks.bunnycdn' => $bunnyConfig]);
-
-        // Perluas Storage Facade dengan driver 'bunnycdn' kustom
-        Storage::extend('bunnycdn', function ($app, $config) use ($bunnyConfig) {
             $adapter = new BunnyCDNAdapter(
                 new BunnyCDNClient(
-                    $bunnyConfig['storage_zone'],
-                    $bunnyConfig['api_key'],
-                    $bunnyConfig['region'] ?? null
+                    $config['storage_zone'],
+                    $config['api_key'],
+                    $config['region'] ?? null,
                 ),
-                $bunnyConfig['cdn_url'] ?? null
+                $config['pull_zone'] ?? $config['cdn_url'] ?? null,
             );
 
+            if (!empty($config['token_auth_key']) && method_exists($adapter, 'setTokenAuthKey')) {
+                $adapter->setTokenAuthKey($config['token_auth_key']);
+            }
+
             return new FilesystemAdapter(
-                new Filesystem($adapter, $bunnyConfig),
+                new Filesystem($adapter, $config),
                 $adapter,
-                $bunnyConfig
+                $config,
             );
         });
     }
 
     /**
-     * Mengambil BunnyCDN API Key dari file sementara atau dari Novay\BunnySecret\Helpers\Secret service.
-     *
-     * Key akan di-cache di file sementara untuk mengurangi panggilan ke layanan Secret.
-     *
-     * @return string|null Mengembalikan API key jika berhasil ditemukan, null jika tidak.
+     * @param array<string, mixed> $config
+     * @return array<string, mixed>
      */
-    protected function getBunnyApiKey(): ?string
+    protected function resolveDiskConfig(array $config): array
     {
-        $secretFile = config('bunnycdn.secret_file');
-        $secretKeyName = config('bunnycdn.secret_key_name');
+        $packageDisk = config('bunnycdn.disk', []);
+        $config = array_replace_recursive($packageDisk, $config);
 
-        // Cek apakah API key sudah ada di file sementara
-        if (Storage::exists($secretFile)) {
-            return Storage::get($secretFile);
+        $config['driver'] = 'bunnycdn';
+        $config['pull_zone'] = $this->nullableString($config['pull_zone'] ?? $config['cdn_url'] ?? null);
+        $config['cdn_url'] = $this->nullableString($config['cdn_url'] ?? $config['pull_zone'] ?? null);
+        $config['api_key'] = $this->resolveBunnyApiKey($config);
+
+        foreach (['storage_zone', 'api_key'] as $requiredKey) {
+            if (empty($config[$requiredKey])) {
+                throw BunnySecretException::missingConfig("disk.{$requiredKey}");
+            }
         }
 
-        // Jika tidak ada, ambil dari service Novay\BunnySecret\Helpers\Secret
-        try {
-            // Pastikan service Novay\BunnySecret\Helpers\Secret terdaftar dan tersedia
-            if (app()->bound(Secret::class)) {
-                $bunnyApiKey = app(Secret::class)->getSecret($secretKeyName);
+        return $config;
+    }
 
-                // Simpan ke file sementara untuk penggunaan selanjutnya
-                Storage::put($secretFile, $bunnyApiKey);
+    /**
+     * @param array<string, mixed> $config
+     */
+    protected function resolveBunnyApiKey(array $config): ?string
+    {
+        $configuredApiKey = $this->nullableString($config['api_key'] ?? null);
 
-                return $bunnyApiKey;
-            }
-            Log::error("Novay\\BunnySecret\\Helpers\\Secret service not found. Cannot retrieve BunnyCDN API Key for '{$secretKeyName}'.");
+        if ($configuredApiKey !== null) {
+            return $configuredApiKey;
+        }
+
+        $secretFileApiKey = $this->readApiKeyFromSecretFile();
+
+        if ($secretFileApiKey !== null) {
+            return $secretFileApiKey;
+        }
+
+        $secretName = $this->nullableString(config('bunnycdn.secret_key_name'));
+
+        if ($secretName === null || !$this->shouldUseSecretApi()) {
             return null;
+        }
 
+        try {
+            $apiKey = $this->app->make(Secret::class)->getSecret($secretName);
+            $apiKey = $this->nullableString(is_scalar($apiKey) ? (string) $apiKey : null);
+
+            if ($apiKey !== null && $this->shouldCacheSecretFile()) {
+                $this->writeApiKeyToSecretFile($apiKey);
+            }
+
+            return $apiKey;
         } catch (Throwable $e) {
-            Log::error('Error retrieving BunnyCDN API Key from Novay\\BunnySecret\\Helpers\\Secret: ' . $e->getMessage());
+            Log::warning('Unable to resolve BunnyCDN API key from secret service.', [
+                'secret_key_name' => $secretName,
+                'exception' => $e::class,
+                'message' => $e->getMessage(),
+            ]);
+
             return null;
         }
     }
+
+    protected function readApiKeyFromSecretFile(): ?string
+    {
+        $path = $this->secretFilePath();
+
+        if ($path === null || !is_file($path) || !is_readable($path)) {
+            return null;
+        }
+
+        $apiKey = file_get_contents($path);
+
+        return $this->nullableString($apiKey === false ? null : $apiKey);
+    }
+
+    protected function writeApiKeyToSecretFile(string $apiKey): void
+    {
+        $path = $this->secretFilePath();
+
+        if ($path === null) {
+            return;
+        }
+
+        $directory = dirname($path);
+
+        if (!is_dir($directory)) {
+            mkdir($directory, 0755, true);
+        }
+
+        file_put_contents($path, $apiKey);
+    }
+
+    protected function secretFilePath(): ?string
+    {
+        $secretFile = $this->nullableString(config('bunnycdn.secret_file'));
+
+        if ($secretFile === null) {
+            return null;
+        }
+
+        if (str_starts_with($secretFile, DIRECTORY_SEPARATOR)) {
+            return $secretFile;
+        }
+
+        return storage_path('app/' . ltrim($secretFile, '/\\'));
+    }
+
+    protected function shouldCacheSecretFile(): bool
+    {
+        return static::truthy(config('bunnycdn.cache_secret_file', true));
+    }
+
+    protected function shouldUseSecretApi(): bool
+    {
+        return static::truthy(config('bunnycdn.secret_api.enabled', false));
+    }
+
+    protected function nullableString(mixed $value): ?string
+    {
+        if (!is_scalar($value)) {
+            return null;
+        }
+
+        $value = trim((string) $value);
+
+        return $value === '' ? null : $value;
+    }
+
+    protected static function truthy(mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        if (is_int($value)) {
+            return $value === 1;
+        }
+
+        if (is_string($value)) {
+            return filter_var($value, FILTER_VALIDATE_BOOLEAN);
+        }
+
+        return false;
+    }
 }
+

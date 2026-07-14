@@ -2,147 +2,315 @@
 
 namespace Novay\BunnySecret;
 
-use Illuminate\Support\Facades\Storage;
+use Illuminate\Http\File;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Novay\BunnySecret\Helpers\Secret;
+use Novay\BunnySecret\Support\Path;
+use SplFileInfo;
+use Throwable;
 
-/**
- * BunnySecretManager
- *
- * Kelas ini bertanggung jawab untuk mengelola operasi file terkait BunnyCDN,
- * termasuk upload, pengambilan URL, dan penghapusan file. Ini juga menyediakan
- * integrasi dengan ImageKit.io untuk transformasi gambar dan layanan Secret
- * untuk mengambil kunci rahasia.
- *
- * @package Novay\BunnySecret
- * @author Novay <novay@btekno.id>
- * @license https://opensource.org/licenses/MIT MIT License
- */
 class BunnySecretManager
 {
-    /**
-     * Instance dari layanan Novay\BunnySecret\Helpers\Secret untuk mengambil rahasia.
-     *
-     * @var Secret
-     */
-    protected Secret $secretService;
+    public function __construct(protected Secret $secretService) {}
 
-    /**
-     * Konstruktor kelas BunnySecretManager.
-     *
-     * Menginisialisasi kelas dengan instance dari layanan Secret.
-     *
-     * @param Secret $secretService Layanan untuk mengambil rahasia.
-     */
-    public function __construct(Secret $secretService)
+    public function secret(): Secret
     {
-        $this->secretService = $secretService;
+        return $this->secretService;
+    }
+
+    public function hasSecretManager(): bool
+    {
+        return $this->secretService->isConfigured();
+    }
+
+    public function getSecret(string $key): mixed
+    {
+        return $this->secretService->getSecret($key);
     }
 
     /**
-     * Menghasilkan URL ImageKit dari URL S3 yang diberikan.
-     *
-     * Metode ini membersihkan URL S3 dan menyiapkannya untuk transformasi gambar
-     * melalui ImageKit. URL yang dihasilkan di-cache untuk performa.
-     *
-     * @param string $url URL asli dari file gambar di S3.
-     * @param int $resolution Resolusi tinggi gambar yang diinginkan (default 500px).
-     * @return string URL gambar yang telah diubah dengan ImageKit.
+     * @return array<string, mixed>
      */
+    public function storeSecret(string $key, mixed $value): array
+    {
+        return $this->secretService->storeSecret($key, $value);
+    }
+
+    public function deleteSecret(string $key): bool
+    {
+        return $this->secretService->deleteSecret($key);
+    }
+
     public function imageKit(string $url, int $resolution = 500): string
     {
-        $cacheKey = 'imagekit_' . md5($url . $resolution);
-
-        return Cache::remember($cacheKey, 60, function () use ($url, $resolution) {
-            // Asumsi URL S3 memiliki format: https://[BUCKET_NAME].s3.[REGION].amazonaws.com/[PATH]
-            // Kita perlu membersihkan bagian base S3 URL untuk mendapatkan PATH yang murni
-            $s3Bucket = env('AWS_BUCKET');
-            $s3Region = env('AWS_DEFAULT_REGION');
-            $s3BaseUrl = "https://{$s3Bucket}.s3.{$s3Region}.amazonaws.com/";
-
-            $cleanedUrl = str_replace($s3BaseUrl, '', $url);
-
-            return "https://ik.imagekit.io/enterwind/tr:h-{$resolution}/{$cleanedUrl}";
-        });
-    }
-
-    /**
-     * Mengunggah file ke BunnyCDN.
-     *
-     * File akan disimpan di zona penyimpanan BunnyCDN. Nama file dapat disesuaikan,
-     * dan jika tidak diberikan, nama unik akan dihasilkan.
-     *
-     * @param mixed $file Instance file yang diunggah.
-     * @param string $path Direktori tujuan di dalam zona penyimpanan (default 'temp').
-     * @param string|null $filename Nama file kustom, atau null untuk menghasilkan nama unik.
-     * @param string $disk Disk filesystem yang akan digunakan (default 'bunnycdn').
-     * @return string|false Jalur file yang disimpan (relatif terhadap zona penyimpanan) atau false jika gagal.
-     */
-    public function uploadCDN($file, string $path = 'temp', ?string $filename = null, string $disk = 'bunnycdn')
-    {
-        if (!($file instanceof \Illuminate\Http\UploadedFile)) {
-             Log::error('Invalid file instance provided to uploadCDN.', ['file_type' => gettype($file)]);
-             return false;
+        if (!config('bunnycdn.imagekit.enabled', true)) {
+            return $url;
         }
 
-        $finalFilename = $filename ? "{$filename}.{$file->getClientOriginalExtension()}" : uniqid() . '_' . trim($file->getClientOriginalName());
+        $endpoint = trim((string) config('bunnycdn.imagekit.endpoint', ''));
 
-        $fullPath = rtrim($path, '/') . '/' . $finalFilename;
+        if ($endpoint === '') {
+            return $url;
+        }
 
-        // Note: The third parameter of `put` can be an array of options (e.g., ACL).
-        // The current implementation passes an empty array, which is fine.
-        $stored = Storage::disk($disk)->put($fullPath, $file->get(), []);
+        $resolution = max(1, $resolution);
+        $cacheTtl = max(0, (int) config('bunnycdn.imagekit.cache_ttl', 3600));
+        $cacheKey = 'bunny-secret:imagekit:' . md5($url . '|' . $resolution . '|' . $endpoint);
 
-        return $stored ? '/' . $fullPath : false;
+        $callback = function () use ($url, $resolution, $endpoint): string {
+            $path = $this->extractAssetPath($url);
+
+            if ($path === '') {
+                return $url;
+            }
+
+            return rtrim($endpoint, '/') . "/tr:h-{$resolution}/" . ltrim($path, '/');
+        };
+
+        if ($cacheTtl === 0) {
+            return $callback();
+        }
+
+        return Cache::remember($cacheKey, $cacheTtl, $callback);
     }
 
     /**
-     * Mendapatkan URL publik lengkap untuk file yang disimpan di BunnyCDN.
+     * Upload a file to Bunny.net Storage.
      *
-     * URL dibangun berdasarkan path relatif file dan URL zona CDN yang terkonfigurasi.
-     *
-     * @param string $path Jalur relatif file di dalam zona penyimpanan (e.g., '/gambar/foto-saya.jpg').
-     * @param bool $zone Menentukan apakah akan menyertakan URL zona CDN dasar (true secara default).
-     * @return string URL publik lengkap dari file.
+     * The legacy return value is preserved: a stored path with a leading slash,
+     * or false when the upload fails.
      */
+    public function uploadCDN(mixed $file, string $path = 'temp', ?string $filename = null, string $disk = 'bunnycdn'): string|false
+    {
+        try {
+            $source = $this->resolveUploadSource($file);
+
+            if ($source === null) {
+                Log::warning('BunnySecret upload failed: unsupported or unreadable file.', [
+                    'type' => is_object($file) ? $file::class : gettype($file),
+                ]);
+
+                return false;
+            }
+
+            $targetPath = Path::join($path, $this->resolveFilename($file, $filename));
+            $stream = fopen($source, 'rb');
+
+            if ($stream === false) {
+                Log::warning('BunnySecret upload failed: unable to open file stream.', [
+                    'source' => $source,
+                    'target' => $targetPath,
+                ]);
+
+                return false;
+            }
+
+            try {
+                $stored = Storage::disk($disk)->put($targetPath, $stream);
+            } finally {
+                if (is_resource($stream)) {
+                    fclose($stream);
+                }
+            }
+
+            return $stored ? '/' . $targetPath : false;
+        } catch (Throwable $e) {
+            Log::error('BunnySecret upload failed.', [
+                'disk' => $disk,
+                'path' => $path,
+                'exception' => $e::class,
+                'message' => $e->getMessage(),
+            ]);
+
+            return false;
+        }
+    }
+
     public function showCDN(string $path, bool $zone = true): string
     {
-        $return = '';
-        $zone_url = config('bunnycdn.disk.cdn_url');
+        $path = trim($path);
 
-        if ($zone && $zone_url) {
-            $return .= rtrim($zone_url, '/') . '/';
+        if ($path === '') {
+            return '';
         }
 
-        if (!empty($return) && str_starts_with($path, '/')) {
-            $path = ltrim($path, '/');
+        if (filter_var($path, FILTER_VALIDATE_URL)) {
+            return $path;
         }
 
-        return "{$return}{$path}";
+        $cleanPath = Path::clean($path);
+
+        if (!$zone) {
+            return $cleanPath;
+        }
+
+        $baseUrl = $this->cdnUrl();
+
+        if ($baseUrl !== null) {
+            return rtrim($baseUrl, '/') . '/' . $cleanPath;
+        }
+
+        try {
+            return Storage::disk('bunnycdn')->url($cleanPath);
+        } catch (Throwable) {
+            return $cleanPath;
+        }
     }
 
-    /**
-     * Menghapus file dari BunnyCDN.
-     *
-     * Memeriksa keberadaan file di disk yang ditentukan sebelum mencoba menghapusnya.
-     *
-     * @param string $filePath Jalur relatif file yang akan dihapus (e.g., '/gambar/foto-saya.jpg').
-     * @param string $disk Disk filesystem yang akan digunakan (default 'bunnycdn').
-     * @return bool True jika penghapusan berhasil, false jika tidak.
-     */
     public function deleteCDN(string $filePath, string $disk = 'bunnycdn'): bool
     {
-        if (empty($filePath)) {
+        $cleanPath = Path::fromUrl($filePath, $this->cdnUrl());
+
+        if ($cleanPath === '') {
             return false;
         }
 
-        $cleanedPath = ltrim($filePath, '/');
+        try {
+            if (Storage::disk($disk)->exists($cleanPath)) {
+                return Storage::disk($disk)->delete($cleanPath);
+            }
 
-        if (Storage::disk($disk)->exists($cleanedPath)) {
-            return Storage::disk($disk)->delete($cleanedPath);
+            return false;
+        } catch (Throwable $e) {
+            Log::warning('BunnySecret delete failed.', [
+                'disk' => $disk,
+                'path' => $cleanPath,
+                'exception' => $e::class,
+                'message' => $e->getMessage(),
+            ]);
+
+            return false;
+        }
+    }
+
+    public function existsCDN(string $filePath, string $disk = 'bunnycdn'): bool
+    {
+        $cleanPath = Path::fromUrl($filePath, $this->cdnUrl());
+
+        if ($cleanPath === '') {
+            return false;
         }
 
-        return false;
+        try {
+            return Storage::disk($disk)->exists($cleanPath);
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    protected function resolveUploadSource(mixed $file): ?string
+    {
+        if ($file instanceof UploadedFile || $file instanceof File || $file instanceof SplFileInfo) {
+            $path = $file->getRealPath() ?: $file->getPathname();
+
+            return is_string($path) && is_file($path) && is_readable($path) ? $path : null;
+        }
+
+        if (is_string($file)) {
+            return is_file($file) && is_readable($file) ? $file : null;
+        }
+
+        return null;
+    }
+
+    protected function resolveFilename(mixed $file, ?string $filename): string
+    {
+        $extension = $this->resolveExtension($file);
+        $filename = $filename !== null ? trim($filename) : '';
+
+        if ($filename === '') {
+            $filename = $this->uniqueFilename($file);
+        }
+
+        $filename = $this->sanitizeFilename($filename);
+
+        if ($extension !== '' && pathinfo($filename, PATHINFO_EXTENSION) === '') {
+            $filename .= '.' . $extension;
+        }
+
+        return $filename;
+    }
+
+    protected function uniqueFilename(mixed $file): string
+    {
+        $baseName = 'file';
+
+        if ($file instanceof UploadedFile) {
+            $baseName = pathinfo($file->getClientOriginalName(), PATHINFO_FILENAME) ?: $baseName;
+        } elseif ($file instanceof SplFileInfo) {
+            $baseName = pathinfo($file->getFilename(), PATHINFO_FILENAME) ?: $baseName;
+        } elseif (is_string($file)) {
+            $baseName = pathinfo($file, PATHINFO_FILENAME) ?: $baseName;
+        }
+
+        try {
+            $suffix = bin2hex(random_bytes(8));
+        } catch (Throwable) {
+            $suffix = str_replace('.', '', uniqid('', true));
+        }
+
+        return $baseName . '-' . $suffix;
+    }
+
+    protected function resolveExtension(mixed $file): string
+    {
+        if ($file instanceof UploadedFile) {
+            return strtolower($file->getClientOriginalExtension() ?: $file->extension() ?: '');
+        }
+
+        if ($file instanceof File) {
+            return strtolower($file->extension() ?: pathinfo($file->getFilename(), PATHINFO_EXTENSION));
+        }
+
+        if ($file instanceof SplFileInfo) {
+            return strtolower(pathinfo($file->getFilename(), PATHINFO_EXTENSION));
+        }
+
+        if (is_string($file)) {
+            return strtolower(pathinfo($file, PATHINFO_EXTENSION));
+        }
+
+        return '';
+    }
+
+    protected function sanitizeFilename(string $filename): string
+    {
+        $filename = str_replace('\\', '/', $filename);
+        $filename = basename($filename);
+        $filename = preg_replace('/[^A-Za-z0-9._-]+/', '-', $filename) ?: '';
+        $filename = trim($filename, '.-_');
+
+        return $filename !== '' ? $filename : 'file-' . str_replace('.', '', uniqid('', true));
+    }
+
+    protected function extractAssetPath(string $url): string
+    {
+        $s3Bucket = trim((string) config('filesystems.disks.s3.bucket', env('AWS_BUCKET', '')));
+        $s3Region = trim((string) config('filesystems.disks.s3.region', env('AWS_DEFAULT_REGION', '')));
+
+        if ($s3Bucket !== '' && $s3Region !== '') {
+            $s3BaseUrl = "https://{$s3Bucket}.s3.{$s3Region}.amazonaws.com/";
+
+            if (str_starts_with($url, $s3BaseUrl)) {
+                return Path::clean(substr($url, strlen($s3BaseUrl)));
+            }
+        }
+
+        if (filter_var($url, FILTER_VALIDATE_URL)) {
+            return Path::clean(parse_url($url, PHP_URL_PATH) ?: '');
+        }
+
+        return Path::clean($url);
+    }
+
+    protected function cdnUrl(): ?string
+    {
+        $url = config('bunnycdn.disk.cdn_url') ?: config('bunnycdn.disk.pull_zone') ?: config('filesystems.disks.bunnycdn.pull_zone');
+        $url = is_scalar($url) ? trim((string) $url) : '';
+
+        return $url === '' ? null : $url;
     }
 }
